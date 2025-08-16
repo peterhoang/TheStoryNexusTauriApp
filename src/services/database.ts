@@ -1,4 +1,5 @@
 import Dexie, { Table } from 'dexie';
+import dexieCloud from 'dexie-cloud-addon';
 import systemPrompts from '@/data/systemPrompts';
 import {
     Story,
@@ -8,7 +9,7 @@ import {
     AISettings,
     LorebookEntry,
     SceneBeat,
-    Note
+    Note,
 } from '../types/story';
 
 export class StoryDatabase extends Dexie {
@@ -20,9 +21,10 @@ export class StoryDatabase extends Dexie {
     lorebookEntries!: Table<LorebookEntry>;
     sceneBeats!: Table<SceneBeat>;
     notes!: Table<Note>;
+    private _meta!: Table<{ id: string; value: any }>;
 
     constructor() {
-        super('StoryDatabase');
+        super('StoryDatabase', { addons: [dexieCloud] });
 
         this.version(12).stores({
             stories: 'id, title, createdAt, language, isDemo',
@@ -33,40 +35,58 @@ export class StoryDatabase extends Dexie {
             lorebookEntries: 'id, storyId, name, category, *tags, isDemo',
             sceneBeats: 'id, storyId, chapterId',
             notes: 'id, storyId, title, type, createdAt, updatedAt',
+            _meta: '&id',
         });
 
-        this.on('populate', async () => {
-            console.log('Populating database with initial data...');
+        this.cloud.configure({
+            databaseUrl: 'https://z1eenxpyu.dexie.cloud',
+            requireAuth: true, // optional
+        });
+    }
 
-            // Add system prompts
+    async initializeDefaultData(): Promise<void> {
+        // Use a transaction to ensure the check and the seeding happen atomically.
+        await this.transaction('rw', this._meta, this.prompts, async () => {
+            const isSeeded = await this._meta.get('systemPromptsSeeded');
+
+            if (isSeeded) {
+                // The flag exists, so the data has already been added. Do nothing.
+                console.log('Default prompts already exist. Skipping seed.');
+                return;
+            }
+
+            console.log('Seeding database with default system prompts...');
+
+            // 1. Add the system prompts from your local data file.
             for (const promptData of systemPrompts) {
                 await this.prompts.add({
                     ...promptData,
                     createdAt: new Date(),
-                    isSystem: true
+                    isSystem: true,
                 } as Prompt);
             }
 
-            console.log('Database successfully populated with initial data');
+            // 2. Set the flag in the metadata table to prevent this code from ever running again.
+            await this._meta.put({ id: 'systemPromptsSeeded', value: true });
+
+            console.log('Successfully seeded default prompts to the cloud.');
         });
     }
 
     // Helper method to create a new story with initial structure
     async createNewStory(storyData: Omit<Story, 'createdAt'>): Promise<string> {
-        return await this.transaction('rw',
-            [this.stories],
-            async () => {
-                const storyId = storyData.id || crypto.randomUUID();
+        return await this.transaction('rw', [this.stories], async () => {
+            const storyId = storyData.id || crypto.randomUUID();
 
-                // Create the story
-                await this.stories.add({
-                    id: storyId,
-                    createdAt: new Date(),
-                    ...storyData
-                });
-
-                return storyId;
+            // Create the story
+            await this.stories.add({
+                id: storyId,
+                createdAt: new Date(),
+                ...storyData,
             });
+
+            return storyId;
+        });
     }
 
     // Helper method to get complete story structure
@@ -81,7 +101,7 @@ export class StoryDatabase extends Dexie {
 
         return {
             ...story,
-            chapters
+            chapters,
         };
     }
 
@@ -100,7 +120,10 @@ export class StoryDatabase extends Dexie {
             .toArray();
     }
 
-    async getLorebookEntriesByCategory(storyId: string, category: LorebookEntry['category']) {
+    async getLorebookEntriesByCategory(
+        storyId: string,
+        category: LorebookEntry['category']
+    ) {
         return await this.lorebookEntries
             .where(['storyId', 'category'])
             .equals([storyId, category])
@@ -109,22 +132,21 @@ export class StoryDatabase extends Dexie {
 
     // Helper methods for SceneBeats
     async getSceneBeatsByChapter(chapterId: string): Promise<SceneBeat[]> {
-        return this.sceneBeats
-            .where('chapterId')
-            .equals(chapterId)
-            .toArray();
+        return this.sceneBeats.where('chapterId').equals(chapterId).toArray();
     }
 
     async getSceneBeat(id: string): Promise<SceneBeat | undefined> {
         return this.sceneBeats.get(id);
     }
 
-    async createSceneBeat(data: Omit<SceneBeat, 'id' | 'createdAt'>): Promise<string> {
+    async createSceneBeat(
+        data: Omit<SceneBeat, 'id' | 'createdAt'>
+    ): Promise<string> {
         const id = crypto.randomUUID();
         await this.sceneBeats.add({
             id,
             createdAt: new Date(),
-            ...data
+            ...data,
         } as SceneBeat);
         return id;
     }
@@ -143,14 +165,18 @@ export class StoryDatabase extends Dexie {
      * @returns Promise that resolves when the deletion is complete
      */
     async deleteStoryWithRelated(storyId: string): Promise<void> {
-        return await this.transaction('rw',
-            [this.stories, this.chapters, this.lorebookEntries, this.aiChats, this.sceneBeats],
+        return await this.transaction(
+            'rw',
+            [
+                this.stories,
+                this.chapters,
+                this.lorebookEntries,
+                this.aiChats,
+                this.sceneBeats,
+            ],
             async () => {
                 // Delete all related chapters
-                await this.chapters
-                    .where('storyId')
-                    .equals(storyId)
-                    .delete();
+                await this.chapters.where('storyId').equals(storyId).delete();
 
                 // Delete all related lorebook entries
                 await this.lorebookEntries
@@ -159,23 +185,22 @@ export class StoryDatabase extends Dexie {
                     .delete();
 
                 // Delete all related AI chats
-                await this.aiChats
-                    .where('storyId')
-                    .equals(storyId)
-                    .delete();
+                await this.aiChats.where('storyId').equals(storyId).delete();
 
                 // Delete all related SceneBeats
-                await this.sceneBeats
-                    .where('storyId')
-                    .equals(storyId)
-                    .delete();
+                await this.sceneBeats.where('storyId').equals(storyId).delete();
 
                 // Finally delete the story itself
                 await this.stories.delete(storyId);
 
                 console.log(`Deleted story ${storyId} and all related data`);
-            });
+            }
+        );
     }
 }
 
-export const db = new StoryDatabase(); 
+export const db = new StoryDatabase();
+
+// db.initializeDefaultData().catch((error) => {
+//     console.error('Failed to initialize default database data:', error);
+// });
